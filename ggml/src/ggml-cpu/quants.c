@@ -108,6 +108,84 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, 
     quantize_row_tq2_0_ref(x, y, k);
 }
 
+void quantize_row_tq3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QKTQ3_0 == 0);
+    block_tq3_0 * GGML_RESTRICT y = vy;
+    quantize_row_tq3_0_ref(x, y, k);
+}
+
+void quantize_row_tq4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QKTQ4_0 == 0);
+    block_tq4_0 * GGML_RESTRICT y = vy;
+    quantize_row_tq4_0_ref(x, y, k);
+}
+
+/*
+ * TQ3_0 vec_dot with F32: dequantize-then-dot approach.
+ * Since TQ3_0 uses rotation-based quantization, we dequantize the block
+ * and compute the dot product with the F32 vector.
+ */
+void ggml_vec_dot_tq3_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const int nb = n / QKTQ3_0;
+    assert(n % QKTQ3_0 == 0);
+
+    const block_tq3_0 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        float tmp[QKTQ3_0];
+        dequantize_row_tq3_0(x + i, tmp, QKTQ3_0);
+
+        float block_sum = 0.0f;
+        for (int j = 0; j < QKTQ3_0; ++j) {
+            block_sum += tmp[j] * y[i * QKTQ3_0 + j];
+        }
+        sumf += block_sum;
+    }
+
+    *s = sumf;
+}
+
+/*
+ * TQ4_0 vec_dot with F32: same dequantize-then-dot approach.
+ */
+void ggml_vec_dot_tq4_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const int nb = n / QKTQ4_0;
+    assert(n % QKTQ4_0 == 0);
+
+    const block_tq4_0 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        float tmp[QKTQ4_0];
+        dequantize_row_tq4_0(x + i, tmp, QKTQ4_0);
+
+        float block_sum = 0.0f;
+        for (int j = 0; j < QKTQ4_0; ++j) {
+            block_sum += tmp[j] * y[i * QKTQ4_0 + j];
+        }
+        sumf += block_sum;
+    }
+
+    *s = sumf;
+}
+
 //===================================== Q8_K ==============================================
 
 void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {

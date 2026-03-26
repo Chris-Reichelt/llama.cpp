@@ -5,6 +5,7 @@
 #include "ggml-impl.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu.h"
+#include "ggml-turboquant.h"
 
 #include <math.h>
 #include <string.h>
@@ -2334,6 +2335,239 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
             }
         }
     }
+}
+
+// ====================== TurboQuant quantization (PolarQuant + optimal Lloyd-Max) ======================
+// Based on: "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate" (arXiv:2504.19874)
+
+/*
+ * TQ3_0: 3-bit TurboQuant quantization
+ *
+ * Algorithm:
+ *   1. Compute L2 norm of 32-element block and normalize
+ *   2. Generate random sign flips from block-specific seed
+ *   3. Apply: random_signs → Fast Walsh-Hadamard Transform → normalize by 1/sqrt(32)
+ *      This makes each coordinate ~ N(0, 1/32) for unit-norm input
+ *   4. Quantize each rotated coordinate to nearest of 8 optimal Lloyd-Max centroids
+ *   5. Pack 3-bit indices into bytes
+ */
+void quantize_row_tq3_0_ref(const float * GGML_RESTRICT x, block_tq3_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QKTQ3_0 == 0);
+    const int64_t nb = k / QKTQ3_0;
+
+    /* Scale factor: sqrt(block_size) to map from N(0,1/d) to N(0,1) codebook */
+    const float scale = sqrtf((float)QKTQ3_0);
+
+    for (int64_t i = 0; i < nb; i++) {
+        float tmp[QKTQ3_0];
+
+        /* Step 1: Compute L2 norm */
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QKTQ3_0; j++) {
+            sum_sq += x[j] * x[j];
+        }
+        float norm = sqrtf(sum_sq);
+        y[i].d = GGML_FP32_TO_FP16(norm);
+
+        if (norm < 1e-10f) {
+            /* Zero block: all indices = centroid closest to 0 (index 3 or 4) */
+            memset(y[i].qs, 0, sizeof(y[i].qs));
+            y[i].seed_lo = 0; y[i].seed_hi = 0;
+            x += QKTQ3_0;
+            continue;
+        }
+
+        /* Step 2: Normalize to unit vector */
+        float inv_norm = 1.0f / norm;
+        for (int j = 0; j < QKTQ3_0; j++) {
+            tmp[j] = x[j] * inv_norm;
+        }
+
+        /* Step 3: Generate seed from block index (deterministic) */
+        /* Use a hash of the block position + some constant for reproducibility */
+        uint32_t seed = (uint32_t)(i * 2654435761u + 0xDEADBEEF);
+        y[i].seed_lo = (uint16_t)(seed & 0xFFFFu); y[i].seed_hi = (uint16_t)(seed >> 16);
+
+        /* Step 4: Apply PolarQuant rotation: random_signs → Hadamard → normalize */
+        tq_rotate_forward(tmp, QKTQ3_0, seed);
+
+        /* Step 5: Quantize each coordinate to nearest 3-bit centroid and pack */
+        /* 3-bit packing: 32 values × 3 bits = 96 bits = 12 bytes
+         * Pack 8 values into 3 bytes: bits [0..2] [3..5] [6..8] ... */
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        for (int j = 0; j < QKTQ3_0; j++) {
+            int idx = tq_quantize_scalar_3bit(tmp[j], scale);
+
+            /* Pack 3-bit index into byte array.
+             * Bit layout: value j's 3 bits start at bit position j*3.
+             * Byte = (j*3)/8, bit offset = (j*3)%8 */
+            int bit_pos = j * 3;
+            int byte_idx = bit_pos / 8;
+            int bit_off  = bit_pos % 8;
+
+            y[i].qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_off);
+            /* Handle cross-byte boundary */
+            if (bit_off > 5) {
+                y[i].qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_off));
+            }
+        }
+
+        x += QKTQ3_0;
+    }
+}
+
+void dequantize_row_tq3_0(const block_tq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QKTQ3_0 == 0);
+    const int64_t nb = k / QKTQ3_0;
+
+    const float scale = sqrtf((float)QKTQ3_0);
+    const float inv_scale = 1.0f / scale;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
+        const uint32_t seed = ((uint32_t)x[i].seed_hi << 16) | (uint32_t)x[i].seed_lo;
+
+        float tmp[QKTQ3_0];
+
+        if (norm < 1e-10f) {
+            for (int j = 0; j < QKTQ3_0; j++) {
+                y[j] = 0.0f;
+            }
+            y += QKTQ3_0;
+            continue;
+        }
+
+        /* Step 1: Unpack 3-bit indices and look up centroids */
+        for (int j = 0; j < QKTQ3_0; j++) {
+            int bit_pos = j * 3;
+            int byte_idx = bit_pos / 8;
+            int bit_off  = bit_pos % 8;
+
+            int idx = (x[i].qs[byte_idx] >> bit_off) & 0x7;
+            if (bit_off > 5) {
+                idx |= (x[i].qs[byte_idx + 1] << (8 - bit_off)) & 0x7;
+            }
+
+            tmp[j] = tq_dequantize_scalar_3bit(idx, inv_scale);
+        }
+
+        /* Step 2: Apply inverse rotation */
+        tq_rotate_inverse(tmp, QKTQ3_0, seed);
+
+        /* Step 3: Rescale by original norm */
+        for (int j = 0; j < QKTQ3_0; j++) {
+            y[j] = tmp[j] * norm;
+        }
+
+        y += QKTQ3_0;
+    }
+}
+
+size_t quantize_tq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_TQ3_0, n_per_row);
+    quantize_row_tq3_0_ref(src, dst, (int64_t)nrow * n_per_row);
+    return nrow * row_size;
+}
+
+/*
+ * TQ4_0: 4-bit TurboQuant quantization
+ *
+ * Same algorithm as TQ3_0 but with 16 centroids (4 bits per coordinate).
+ * 4-bit indices are packed as nibbles, same as q4_0 format.
+ */
+void quantize_row_tq4_0_ref(const float * GGML_RESTRICT x, block_tq4_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QKTQ4_0 == 0);
+    const int64_t nb = k / QKTQ4_0;
+
+    const float scale = sqrtf((float)QKTQ4_0);
+
+    for (int64_t i = 0; i < nb; i++) {
+        float tmp[QKTQ4_0];
+
+        /* Step 1: Compute L2 norm */
+        float sum_sq = 0.0f;
+        for (int j = 0; j < QKTQ4_0; j++) {
+            sum_sq += x[j] * x[j];
+        }
+        float norm = sqrtf(sum_sq);
+        y[i].d = GGML_FP32_TO_FP16(norm);
+
+        if (norm < 1e-10f) {
+            memset(y[i].qs, 0, sizeof(y[i].qs));
+            y[i].seed_lo = 0; y[i].seed_hi = 0;
+            x += QKTQ4_0;
+            continue;
+        }
+
+        /* Step 2: Normalize */
+        float inv_norm = 1.0f / norm;
+        for (int j = 0; j < QKTQ4_0; j++) {
+            tmp[j] = x[j] * inv_norm;
+        }
+
+        /* Step 3: Rotation seed and apply PolarQuant rotation */
+        uint32_t seed = (uint32_t)(i * 2654435761u + 0xDEADBEEF);
+        y[i].seed_lo = (uint16_t)(seed & 0xFFFFu); y[i].seed_hi = (uint16_t)(seed >> 16);
+        tq_rotate_forward(tmp, QKTQ4_0, seed);
+
+        /* Step 4: Quantize to 4-bit centroids and pack as nibbles */
+        for (int j = 0; j < QKTQ4_0 / 2; j++) {
+            int idx0 = tq_quantize_scalar_4bit(tmp[2*j + 0], scale);
+            int idx1 = tq_quantize_scalar_4bit(tmp[2*j + 1], scale);
+            y[i].qs[j] = (uint8_t)(idx0 | (idx1 << 4));
+        }
+
+        x += QKTQ4_0;
+    }
+}
+
+void dequantize_row_tq4_0(const block_tq4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QKTQ4_0 == 0);
+    const int64_t nb = k / QKTQ4_0;
+
+    const float scale = sqrtf((float)QKTQ4_0);
+    const float inv_scale = 1.0f / scale;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
+        const uint32_t seed = ((uint32_t)x[i].seed_hi << 16) | (uint32_t)x[i].seed_lo;
+
+        float tmp[QKTQ4_0];
+
+        if (norm < 1e-10f) {
+            for (int j = 0; j < QKTQ4_0; j++) {
+                y[j] = 0.0f;
+            }
+            y += QKTQ4_0;
+            continue;
+        }
+
+        /* Step 1: Unpack 4-bit indices (nibbles) and look up centroids */
+        for (int j = 0; j < QKTQ4_0 / 2; j++) {
+            int idx0 = x[i].qs[j] & 0x0F;
+            int idx1 = (x[i].qs[j] >> 4) & 0x0F;
+            tmp[2*j + 0] = tq_dequantize_scalar_4bit(idx0, inv_scale);
+            tmp[2*j + 1] = tq_dequantize_scalar_4bit(idx1, inv_scale);
+        }
+
+        /* Step 2: Apply inverse rotation */
+        tq_rotate_inverse(tmp, QKTQ4_0, seed);
+
+        /* Step 3: Rescale by original norm */
+        for (int j = 0; j < QKTQ4_0; j++) {
+            y[j] = tmp[j] * norm;
+        }
+
+        y += QKTQ4_0;
+    }
+}
+
+size_t quantize_tq4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_TQ4_0, n_per_row);
+    quantize_row_tq4_0_ref(src, dst, (int64_t)nrow * n_per_row);
+    return nrow * row_size;
 }
 
 // ====================== "True" 2-bit (de)-quantization
@@ -5352,6 +5586,14 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TQ2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
+            } break;
+        case GGML_TYPE_TQ3_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_tq3_0, data, nb);
+            } break;
+        case GGML_TYPE_TQ4_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_tq4_0, data, nb);
             } break;
         case GGML_TYPE_IQ1_S:
             {

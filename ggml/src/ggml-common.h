@@ -267,6 +267,44 @@ typedef struct {
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
 //
+// TurboQuant quantization (PolarQuant: random rotation + optimal Lloyd-Max scalar quantization)
+// Based on: "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate" (arXiv:2504.19874)
+//
+// Block size 32.
+// PolarQuant applies a fast random rotation (Hadamard * random_signs) per block,
+// then quantizes each rotated coordinate to an optimal Lloyd-Max centroid for N(0,1/d).
+// The rotation makes coordinates nearly independent with known distribution,
+// so simple scalar quantization becomes near-optimal.
+//
+
+// TQ3_0: 3-bit TurboQuant (8 centroids per coordinate, Lloyd-Max optimal for N(0,1/d))
+// Storage layout (no padding): d (fp16) + seed_lo (u16) + seed_hi (u16) + qs (12 bytes)
+// Total: 2 + 2 + 2 + 12 = 18 bytes per 32 elements (~4.5 bpw including metadata)
+// Effective quantization: 3 bits per coordinate
+// The 32-bit rotation seed is split into two uint16_t to avoid struct padding.
+#define QKTQ3_0 32
+typedef struct {
+    ggml_half d;                  // L2 norm of original block (for rescaling after dequant)
+    uint16_t seed_lo;             // lower 16 bits of xorshift32 rotation seed
+    uint16_t seed_hi;             // upper 16 bits of xorshift32 rotation seed
+    uint8_t qs[QKTQ3_0 * 3 / 8]; // 3-bit indices packed (12 bytes for 32 elements)
+} block_tq3_0;
+static_assert(sizeof(block_tq3_0) == 2*sizeof(ggml_half) + sizeof(uint16_t) + QKTQ3_0 * 3 / 8, "wrong tq3_0 block size/padding");
+
+// TQ4_0: 4-bit TurboQuant (16 centroids per coordinate, Lloyd-Max optimal for N(0,1/d))
+// Storage layout (no padding): d (fp16) + seed_lo (u16) + seed_hi (u16) + qs (16 bytes)
+// Total: 2 + 2 + 2 + 16 = 22 bytes per 32 elements (~5.5 bpw including metadata)
+// Effective quantization: 4 bits per coordinate
+#define QKTQ4_0 32
+typedef struct {
+    ggml_half d;              // L2 norm of original block (for rescaling after dequant)
+    uint16_t seed_lo;         // lower 16 bits of xorshift32 rotation seed
+    uint16_t seed_hi;         // upper 16 bits of xorshift32 rotation seed
+    uint8_t qs[QKTQ4_0 / 2]; // 4-bit indices packed as nibbles (16 bytes for 32 elements)
+} block_tq4_0;
+static_assert(sizeof(block_tq4_0) == 2*sizeof(ggml_half) + sizeof(uint16_t) + QKTQ4_0 / 2, "wrong tq4_0 block size/padding");
+
+//
 // Super-block quantization structures
 //
 
