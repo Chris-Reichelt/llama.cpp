@@ -617,6 +617,163 @@ static void dequantize_row_mxfp4_cuda(const void * vx, dst_t * y, const int64_t 
     dequantize_block_mxfp4<<<nb, 32, 0, stream>>>(vx, y);
 }
 
+/*
+ * TQ3_0 CUDA dequantize kernel: one warp (32 threads) per block.
+ * Each thread handles one element of the 32-element block.
+ * Steps: unpack 3-bit index → centroid lookup → inverse WHT via warp shuffles → scale by norm.
+ */
+
+/* Precomputed TQ3 centroids scaled by 1/sqrt(32) for N(0,1/d) */
+__device__ static const float d_tq3_centroids[8] = {
+    -1.7479f, -1.0500f, -0.5006f, -0.0000f,
+     0.0000f,  0.5006f,  1.0500f,  1.7479f
+};
+
+__device__ static const float d_tq4_centroids[16] = {
+    -2.4008f, -1.8438f, -1.4371f, -1.0993f,
+    -0.7994f, -0.5224f, -0.2582f,  0.0000f,
+     0.0000f,  0.2582f,  0.5224f,  0.7994f,
+     1.0993f,  1.4371f,  1.8438f,  2.4008f
+};
+
+/* GPU xorshift32 PRNG — matches CPU implementation */
+__device__ static inline uint32_t d_tq_xorshift32(uint32_t x) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return x;
+}
+
+/* GPU Walsh-Hadamard Transform via warp shuffles.
+ * Each thread holds one element. 5 butterfly stages for n=32. */
+__device__ static inline float warp_hadamard_32(float val) {
+    /* Stage 1: stride=1 (pairs 0-1, 2-3, ...) */
+    float pair = __shfl_xor_sync(0xFFFFFFFF, val, 1);
+    val = (threadIdx.x & 1) ? (pair - val) : (val + pair);
+
+    /* Stage 2: stride=2 */
+    pair = __shfl_xor_sync(0xFFFFFFFF, val, 2);
+    val = (threadIdx.x & 2) ? (pair - val) : (val + pair);
+
+    /* Stage 3: stride=4 */
+    pair = __shfl_xor_sync(0xFFFFFFFF, val, 4);
+    val = (threadIdx.x & 4) ? (pair - val) : (val + pair);
+
+    /* Stage 4: stride=8 */
+    pair = __shfl_xor_sync(0xFFFFFFFF, val, 8);
+    val = (threadIdx.x & 8) ? (pair - val) : (val + pair);
+
+    /* Stage 5: stride=16 */
+    pair = __shfl_xor_sync(0xFFFFFFFF, val, 16);
+    val = (threadIdx.x & 16) ? (pair - val) : (val + pair);
+
+    return val;
+}
+
+/* Get the random sign for thread's position from seed */
+__device__ static inline float d_tq_get_sign(uint32_t seed, int j) {
+    uint32_t state = seed;
+    for (int i = 0; i <= j; i++) {
+        state = d_tq_xorshift32(state);
+    }
+    return (state & 1) ? -1.0f : 1.0f;
+}
+
+template <typename dst_t>
+static __global__ void dequantize_block_tq3_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t nb) {
+    const int64_t block_idx = blockIdx.x;
+    if (block_idx >= nb) return;
+
+    const int tid = threadIdx.x;  /* 0..31, one per element */
+    const block_tq3_0 * x = (const block_tq3_0 *)vx + block_idx;
+    dst_t * y = yy + block_idx * 32;
+
+    const float norm = __half2float(x->d);
+    const uint32_t seed = ((uint32_t)x->seed_hi << 16) | (uint32_t)x->seed_lo;
+
+    if (norm < 1e-10f) {
+        y[tid] = (dst_t)0.0f;
+        return;
+    }
+
+    /* Unpack 3-bit index for this thread's element */
+    int bit_pos = tid * 3;
+    int byte_idx = bit_pos / 8;
+    int bit_off  = bit_pos % 8;
+
+    int idx = (x->qs[byte_idx] >> bit_off) & 0x7;
+    if (bit_off > 5) {
+        idx |= (x->qs[byte_idx + 1] << (8 - bit_off)) & 0x7;
+    }
+
+    /* Centroid lookup (in N(0,1) space), scale to rotated domain */
+    const float inv_scale = 1.0f / sqrtf(32.0f);
+    float val = d_tq3_centroids[idx] * inv_scale;
+
+    /* Inverse rotation: Hadamard → scale by 1/sqrt(n) → undo sign flips */
+    val = warp_hadamard_32(val);
+    val *= inv_scale;  /* normalize WHT by 1/sqrt(32) */
+
+    /* Undo random sign flips */
+    float sign = d_tq_get_sign(seed, tid);
+    val *= sign;
+
+    /* Scale by original norm */
+    y[tid] = (dst_t)(val * norm);
+}
+
+template <typename dst_t>
+static __global__ void dequantize_block_tq4_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t nb) {
+    const int64_t block_idx = blockIdx.x;
+    if (block_idx >= nb) return;
+
+    const int tid = threadIdx.x;
+    const block_tq4_0 * x = (const block_tq4_0 *)vx + block_idx;
+    dst_t * y = yy + block_idx * 32;
+
+    const float norm = __half2float(x->d);
+    const uint32_t seed = ((uint32_t)x->seed_hi << 16) | (uint32_t)x->seed_lo;
+
+    if (norm < 1e-10f) {
+        y[tid] = (dst_t)0.0f;
+        return;
+    }
+
+    /* Unpack 4-bit index (nibble) for this thread's element */
+    int byte_idx = tid / 2;
+    int idx;
+    if (tid & 1) {
+        idx = x->qs[byte_idx] >> 4;
+    } else {
+        idx = x->qs[byte_idx] & 0x0F;
+    }
+
+    const float inv_scale = 1.0f / sqrtf(32.0f);
+    float val = d_tq4_centroids[idx] * inv_scale;
+
+    /* Inverse rotation */
+    val = warp_hadamard_32(val);
+    val *= inv_scale;
+
+    /* Undo random sign flips */
+    float sign = d_tq_get_sign(seed, tid);
+    val *= sign;
+
+    y[tid] = (dst_t)(val * norm);
+}
+
+template <typename dst_t>
+static void dequantize_row_tq3_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int64_t nb = k / 32;
+    dequantize_block_tq3_0<<<nb, 32, 0, stream>>>(vx, y, nb);
+}
+
+template <typename dst_t>
+static void dequantize_row_tq4_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int64_t nb = k / 32;
+    dequantize_block_tq4_0<<<nb, 32, 0, stream>>>(vx, y, nb);
+}
+
 template <typename src_t, typename dst_t>
 static __global__ void convert_unary(
         const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t ne00, const int64_t ne01,
@@ -715,6 +872,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_iq3_s_cuda;
         case GGML_TYPE_MXFP4:
             return dequantize_row_mxfp4_cuda;
+        case GGML_TYPE_TQ3_0:
+            return dequantize_row_tq3_0_cuda;
+        case GGML_TYPE_TQ4_0:
+            return dequantize_row_tq4_0_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -766,6 +927,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_iq3_s_cuda;
         case GGML_TYPE_MXFP4:
             return dequantize_row_mxfp4_cuda;
+        case GGML_TYPE_TQ3_0:
+            return dequantize_row_tq3_0_cuda;
+        case GGML_TYPE_TQ4_0:
+            return dequantize_row_tq4_0_cuda;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:

@@ -22,6 +22,8 @@
 
 #define UNUSED GGML_UNUSED
 
+#include "ggml-turboquant.h"
+
 // some compilers don't provide _mm256_set_m128i, e.g. gcc 7
 #define MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
 
@@ -3817,4 +3819,230 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     UNUSED(nb);
     ggml_vec_dot_iq4_xs_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
+}
+
+/*
+ * TQ3_0 × F32 optimized dot product with AVX2/AVX512 SIMD.
+ *
+ * Strategy: For each block, forward-rotate the F32 query vector into the
+ * same rotated domain as the quantized values, then dot the rotated query
+ * against the centroid values looked up from the 3-bit indices.
+ *
+ * The WHT (Walsh-Hadamard Transform) for 32 elements uses 5 butterfly stages.
+ * With AVX2, we process all 32 elements as a single __m256 (8 floats) × 4.
+ * The sign flips and butterfly operations map to SIMD add/sub/blend.
+ */
+void ggml_vec_dot_tq3_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const int nb = n / QKTQ3_0;
+    assert(n % QKTQ3_0 == 0);
+
+    const block_tq3_0 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+
+    const float inv_scale = 1.0f / sqrtf((float)QKTQ3_0);
+
+    float sumf = 0.0f;
+
+#if defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; ++i) {
+        const float norm = GGML_CPU_FP16_TO_FP32(x[i].d);
+
+        if (norm < 1e-10f) {
+            continue;
+        }
+
+        const uint32_t seed = ((uint32_t)x[i].seed_hi << 16) | (uint32_t)x[i].seed_lo;
+
+        /* Load 32 floats from y into y_rot buffer, apply forward rotation */
+        float y_rot[QKTQ3_0] __attribute__((aligned(32)));
+        for (int j = 0; j < QKTQ3_0; j++) {
+            y_rot[j] = y[i * QKTQ3_0 + j];
+        }
+        tq_rotate_forward(y_rot, QKTQ3_0, seed);
+
+        /* Unpack 3-bit indices and look up centroids, then dot with y_rot.
+         * We use scalar unpack (3-bit is not SIMD-friendly) but SIMD for the
+         * multiply-accumulate. */
+        float centroid_vals[QKTQ3_0] __attribute__((aligned(32)));
+        for (int j = 0; j < QKTQ3_0; j++) {
+            int bit_pos = j * 3;
+            int byte_idx = bit_pos / 8;
+            int bit_off  = bit_pos % 8;
+
+            int idx = (x[i].qs[byte_idx] >> bit_off) & 0x7;
+            if (bit_off > 5) {
+                idx |= (x[i].qs[byte_idx + 1] << (8 - bit_off)) & 0x7;
+            }
+
+            centroid_vals[j] = tq3_centroids[idx];
+        }
+
+        /* AVX2: 4 × 8-wide FMA: dot(centroid_vals, y_rot) */
+        __m256 c0 = _mm256_load_ps(centroid_vals);
+        __m256 c1 = _mm256_load_ps(centroid_vals + 8);
+        __m256 c2 = _mm256_load_ps(centroid_vals + 16);
+        __m256 c3 = _mm256_load_ps(centroid_vals + 24);
+
+        __m256 yr0 = _mm256_load_ps(y_rot);
+        __m256 yr1 = _mm256_load_ps(y_rot + 8);
+        __m256 yr2 = _mm256_load_ps(y_rot + 16);
+        __m256 yr3 = _mm256_load_ps(y_rot + 24);
+
+        __m256 prod = _mm256_mul_ps(c0, yr0);
+        prod = _mm256_fmadd_ps(c1, yr1, prod);
+        prod = _mm256_fmadd_ps(c2, yr2, prod);
+        prod = _mm256_fmadd_ps(c3, yr3, prod);
+
+        /* Scale by norm * inv_scale and accumulate */
+        __m256 scale_vec = _mm256_set1_ps(norm * inv_scale);
+        acc = _mm256_fmadd_ps(scale_vec, prod, acc);
+    }
+
+    sumf = hsum_float_8(acc);
+#else
+    /* Fallback: call the generic implementation */
+    for (int i = 0; i < nb; ++i) {
+        const float norm = GGML_CPU_FP16_TO_FP32(x[i].d);
+        if (norm < 1e-10f) continue;
+
+        const uint32_t seed = ((uint32_t)x[i].seed_hi << 16) | (uint32_t)x[i].seed_lo;
+
+        float y_rot[QKTQ3_0];
+        for (int j = 0; j < QKTQ3_0; j++) {
+            y_rot[j] = y[i * QKTQ3_0 + j];
+        }
+        tq_rotate_forward(y_rot, QKTQ3_0, seed);
+
+        float block_sum = 0.0f;
+        for (int j = 0; j < QKTQ3_0; j++) {
+            int bit_pos = j * 3;
+            int byte_idx = bit_pos / 8;
+            int bit_off  = bit_pos % 8;
+
+            int idx = (x[i].qs[byte_idx] >> bit_off) & 0x7;
+            if (bit_off > 5) {
+                idx |= (x[i].qs[byte_idx + 1] << (8 - bit_off)) & 0x7;
+            }
+
+            block_sum += tq3_centroids[idx] * y_rot[j];
+        }
+        sumf += norm * inv_scale * block_sum;
+    }
+#endif
+
+    *s = sumf;
+}
+
+/*
+ * TQ4_0 × F32 optimized dot product with AVX2/AVX512 SIMD.
+ * 4-bit nibble unpacking is much more SIMD-friendly than 3-bit.
+ */
+void ggml_vec_dot_tq4_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const int nb = n / QKTQ4_0;
+    assert(n % QKTQ4_0 == 0);
+
+    const block_tq4_0 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+
+    const float inv_scale = 1.0f / sqrtf((float)QKTQ4_0);
+
+    float sumf = 0.0f;
+
+#if defined(__AVX2__)
+    /* Precompute the 16 centroid values as a float LUT.
+     * For AVX2 integer gather, we store them so we can do _mm256_i32gather_ps. */
+    float centroid_lut[16] __attribute__((aligned(32)));
+    for (int c = 0; c < 16; c++) {
+        centroid_lut[c] = tq4_centroids[c];
+    }
+
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; ++i) {
+        const float norm = GGML_CPU_FP16_TO_FP32(x[i].d);
+
+        if (norm < 1e-10f) {
+            continue;
+        }
+
+        const uint32_t seed = ((uint32_t)x[i].seed_hi << 16) | (uint32_t)x[i].seed_lo;
+
+        /* Forward-rotate query */
+        float y_rot[QKTQ4_0] __attribute__((aligned(32)));
+        for (int j = 0; j < QKTQ4_0; j++) {
+            y_rot[j] = y[i * QKTQ4_0 + j];
+        }
+        tq_rotate_forward(y_rot, QKTQ4_0, seed);
+
+        /* Unpack 4-bit nibbles and gather centroid values.
+         * 16 bytes → 32 nibbles → 32 centroid lookups */
+        float centroid_vals[QKTQ4_0] __attribute__((aligned(32)));
+        for (int j = 0; j < QKTQ4_0 / 2; j++) {
+            int idx_lo = x[i].qs[j] & 0x0F;
+            int idx_hi = x[i].qs[j] >> 4;
+            centroid_vals[j * 2]     = centroid_lut[idx_lo];
+            centroid_vals[j * 2 + 1] = centroid_lut[idx_hi];
+        }
+
+        /* AVX2 FMA dot product: centroid_vals · y_rot */
+        __m256 c0 = _mm256_load_ps(centroid_vals);
+        __m256 c1 = _mm256_load_ps(centroid_vals + 8);
+        __m256 c2 = _mm256_load_ps(centroid_vals + 16);
+        __m256 c3 = _mm256_load_ps(centroid_vals + 24);
+
+        __m256 yr0 = _mm256_load_ps(y_rot);
+        __m256 yr1 = _mm256_load_ps(y_rot + 8);
+        __m256 yr2 = _mm256_load_ps(y_rot + 16);
+        __m256 yr3 = _mm256_load_ps(y_rot + 24);
+
+        __m256 prod = _mm256_mul_ps(c0, yr0);
+        prod = _mm256_fmadd_ps(c1, yr1, prod);
+        prod = _mm256_fmadd_ps(c2, yr2, prod);
+        prod = _mm256_fmadd_ps(c3, yr3, prod);
+
+        __m256 scale_vec = _mm256_set1_ps(norm * inv_scale);
+        acc = _mm256_fmadd_ps(scale_vec, prod, acc);
+    }
+
+    sumf = hsum_float_8(acc);
+#else
+    /* Scalar fallback */
+    for (int i = 0; i < nb; ++i) {
+        const float norm = GGML_CPU_FP16_TO_FP32(x[i].d);
+        if (norm < 1e-10f) continue;
+
+        const uint32_t seed = ((uint32_t)x[i].seed_hi << 16) | (uint32_t)x[i].seed_lo;
+
+        float y_rot[QKTQ4_0];
+        for (int j = 0; j < QKTQ4_0; j++) {
+            y_rot[j] = y[i * QKTQ4_0 + j];
+        }
+        tq_rotate_forward(y_rot, QKTQ4_0, seed);
+
+        float block_sum = 0.0f;
+        for (int j = 0; j < QKTQ4_0 / 2; j++) {
+            int idx_lo = x[i].qs[j] & 0x0F;
+            int idx_hi = x[i].qs[j] >> 4;
+            block_sum += tq4_centroids[idx_lo] * y_rot[j * 2];
+            block_sum += tq4_centroids[idx_hi] * y_rot[j * 2 + 1];
+        }
+        sumf += norm * inv_scale * block_sum;
+    }
+#endif
+
+    *s = sumf;
 }

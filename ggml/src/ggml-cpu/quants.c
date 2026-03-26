@@ -4,6 +4,7 @@
 #include "ggml-cpu-impl.h"
 #include "simd-mappings.h"
 #include "ggml-quants.h"
+#include "ggml-turboquant.h"
 #include "quants.h"
 
 #include "arch-fallback.h"
@@ -121,11 +122,18 @@ void quantize_row_tq4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, 
 }
 
 /*
- * TQ3_0 vec_dot with F32: dequantize-then-dot approach.
- * Since TQ3_0 uses rotation-based quantization, we dequantize the block
- * and compute the dot product with the F32 vector.
+ * TQ3_0 optimized vec_dot with F32: rotated-domain dot product.
+ *
+ * Key insight: dot(dequant(x), y) = norm * dot(centroids_rotated, y)
+ * But since centroids_rotated = inverse_rotate(centroids) and
+ * dot(inverse_rotate(c), y) = dot(c, forward_rotate(y)) / block_size
+ * (Hadamard is its own inverse up to scaling)
+ *
+ * So instead of dequantizing x (expensive inverse rotation per block),
+ * we forward-rotate y into the same rotated domain and dot with centroids directly.
+ * This avoids the O(n log n) inverse WHT on x entirely.
  */
-void ggml_vec_dot_tq3_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+void ggml_vec_dot_tq3_0_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
     UNUSED(bx);
@@ -138,26 +146,55 @@ void ggml_vec_dot_tq3_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const voi
     const block_tq3_0 * GGML_RESTRICT x = vx;
     const float * GGML_RESTRICT y = vy;
 
+    const float inv_scale = 1.0f / sqrtf((float)QKTQ3_0);  /* to map centroids from N(0,1) to rotated domain */
+
     float sumf = 0.0f;
 
     for (int i = 0; i < nb; ++i) {
-        float tmp[QKTQ3_0];
-        dequantize_row_tq3_0(x + i, tmp, QKTQ3_0);
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
 
-        float block_sum = 0.0f;
-        for (int j = 0; j < QKTQ3_0; ++j) {
-            block_sum += tmp[j] * y[i * QKTQ3_0 + j];
+        if (norm < 1e-10f) {
+            continue;
         }
-        sumf += block_sum;
+
+        const uint32_t seed = ((uint32_t)x[i].seed_hi << 16) | (uint32_t)x[i].seed_lo;
+
+        /* Forward-rotate the query block into the same rotated domain as x */
+        float y_rot[QKTQ3_0];
+        for (int j = 0; j < QKTQ3_0; j++) {
+            y_rot[j] = y[i * QKTQ3_0 + j];
+        }
+        tq_rotate_forward(y_rot, QKTQ3_0, seed);
+
+        /* Dot product in rotated domain: sum(centroid[idx_j] * y_rot[j]) */
+        float block_sum = 0.0f;
+        for (int j = 0; j < QKTQ3_0; j++) {
+            int bit_pos = j * 3;
+            int byte_idx = bit_pos / 8;
+            int bit_off  = bit_pos % 8;
+
+            int idx = (x[i].qs[byte_idx] >> bit_off) & 0x7;
+            if (bit_off > 5) {
+                idx |= (x[i].qs[byte_idx + 1] << (8 - bit_off)) & 0x7;
+            }
+
+            block_sum += tq3_centroids[idx] * y_rot[j];
+        }
+
+        /* Scale: centroids are for N(0,1), rotated values are scaled by 1/sqrt(n),
+         * and we need to multiply by norm to reconstruct the original magnitude.
+         * The rotation normalization factor (1/sqrt(n)) is applied to y_rot already,
+         * and centroids are in N(0,1) space, so: result = norm * inv_scale * block_sum */
+        sumf += norm * inv_scale * block_sum;
     }
 
     *s = sumf;
 }
 
 /*
- * TQ4_0 vec_dot with F32: same dequantize-then-dot approach.
+ * TQ4_0 optimized vec_dot with F32: same rotated-domain approach.
  */
-void ggml_vec_dot_tq4_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+void ggml_vec_dot_tq4_0_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
     UNUSED(bx);
@@ -170,17 +207,37 @@ void ggml_vec_dot_tq4_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const voi
     const block_tq4_0 * GGML_RESTRICT x = vx;
     const float * GGML_RESTRICT y = vy;
 
+    const float inv_scale = 1.0f / sqrtf((float)QKTQ4_0);
+
     float sumf = 0.0f;
 
     for (int i = 0; i < nb; ++i) {
-        float tmp[QKTQ4_0];
-        dequantize_row_tq4_0(x + i, tmp, QKTQ4_0);
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
 
-        float block_sum = 0.0f;
-        for (int j = 0; j < QKTQ4_0; ++j) {
-            block_sum += tmp[j] * y[i * QKTQ4_0 + j];
+        if (norm < 1e-10f) {
+            continue;
         }
-        sumf += block_sum;
+
+        const uint32_t seed = ((uint32_t)x[i].seed_hi << 16) | (uint32_t)x[i].seed_lo;
+
+        /* Forward-rotate query into rotated domain */
+        float y_rot[QKTQ4_0];
+        for (int j = 0; j < QKTQ4_0; j++) {
+            y_rot[j] = y[i * QKTQ4_0 + j];
+        }
+        tq_rotate_forward(y_rot, QKTQ4_0, seed);
+
+        /* Dot with centroids in rotated domain */
+        float block_sum = 0.0f;
+        for (int j = 0; j < QKTQ4_0 / 2; j++) {
+            int idx_lo = x[i].qs[j] & 0x0F;
+            int idx_hi = x[i].qs[j] >> 4;
+
+            block_sum += tq4_centroids[idx_lo] * y_rot[j * 2];
+            block_sum += tq4_centroids[idx_hi] * y_rot[j * 2 + 1];
+        }
+
+        sumf += norm * inv_scale * block_sum;
     }
 
     *s = sumf;
