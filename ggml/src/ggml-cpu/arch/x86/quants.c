@@ -4046,3 +4046,174 @@ void ggml_vec_dot_tq4_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
     *s = sumf;
 }
+
+/*
+ * AVX2-optimized pre-rotated TQ3_0 × F32 dot product for fused attention.
+ * Query is already in the rotated domain — no WHT needed per key.
+ * This eliminates the dominant O(n_ctx × d × log d) bottleneck in prompt processing.
+ */
+void ggml_vec_dot_tq3_0_f32_prerotated(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const float * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const int nb = n / QKTQ3_0;
+    assert(n % QKTQ3_0 == 0);
+
+    const block_tq3_0 * GGML_RESTRICT x = vx;
+    const float inv_scale = 1.0f / sqrtf((float)QKTQ3_0);
+
+    float sumf = 0.0f;
+
+#if defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; ++i) {
+        const float norm = GGML_CPU_FP16_TO_FP32(x[i].d);
+        if (norm < 1e-10f) continue;
+
+        /* Unpack 3-bit indices → centroid floats */
+        float centroid_vals[QKTQ3_0] __attribute__((aligned(32)));
+        for (int j = 0; j < QKTQ3_0; j++) {
+            int bit_pos = j * 3;
+            int byte_idx = bit_pos / 8;
+            int bit_off  = bit_pos % 8;
+
+            int idx = (x[i].qs[byte_idx] >> bit_off) & 0x7;
+            if (bit_off > 5) {
+                idx |= (x[i].qs[byte_idx + 1] << (8 - bit_off)) & 0x7;
+            }
+            centroid_vals[j] = tq3_centroids[idx];
+        }
+
+        /* AVX2: 4 × 8-wide FMA: dot(centroid_vals, y_prerotated) */
+        __m256 c0 = _mm256_load_ps(centroid_vals);
+        __m256 c1 = _mm256_load_ps(centroid_vals + 8);
+        __m256 c2 = _mm256_load_ps(centroid_vals + 16);
+        __m256 c3 = _mm256_load_ps(centroid_vals + 24);
+
+        __m256 yr0 = _mm256_loadu_ps(vy + i * QKTQ3_0);
+        __m256 yr1 = _mm256_loadu_ps(vy + i * QKTQ3_0 + 8);
+        __m256 yr2 = _mm256_loadu_ps(vy + i * QKTQ3_0 + 16);
+        __m256 yr3 = _mm256_loadu_ps(vy + i * QKTQ3_0 + 24);
+
+        __m256 prod = _mm256_mul_ps(c0, yr0);
+        prod = _mm256_fmadd_ps(c1, yr1, prod);
+        prod = _mm256_fmadd_ps(c2, yr2, prod);
+        prod = _mm256_fmadd_ps(c3, yr3, prod);
+
+        __m256 scale_vec = _mm256_set1_ps(norm * inv_scale);
+        acc = _mm256_fmadd_ps(scale_vec, prod, acc);
+    }
+
+    sumf = hsum_float_8(acc);
+#else
+    /* Fallback to generic */
+    for (int i = 0; i < nb; ++i) {
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
+        if (norm < 1e-10f) continue;
+
+        float block_sum = 0.0f;
+        for (int j = 0; j < QKTQ3_0; j++) {
+            int bit_pos = j * 3;
+            int byte_idx = bit_pos / 8;
+            int bit_off  = bit_pos % 8;
+
+            int idx = (x[i].qs[byte_idx] >> bit_off) & 0x7;
+            if (bit_off > 5) {
+                idx |= (x[i].qs[byte_idx + 1] << (8 - bit_off)) & 0x7;
+            }
+            block_sum += tq3_centroids[idx] * vy[i * QKTQ3_0 + j];
+        }
+        sumf += norm * inv_scale * block_sum;
+    }
+#endif
+
+    *s = sumf;
+}
+
+/*
+ * AVX2-optimized pre-rotated TQ4_0 × F32 dot product for fused attention.
+ */
+void ggml_vec_dot_tq4_0_f32_prerotated(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const float * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const int nb = n / QKTQ4_0;
+    assert(n % QKTQ4_0 == 0);
+
+    const block_tq4_0 * GGML_RESTRICT x = vx;
+    const float inv_scale = 1.0f / sqrtf((float)QKTQ4_0);
+
+    float sumf = 0.0f;
+
+#if defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; ++i) {
+        const float norm = GGML_CPU_FP16_TO_FP32(x[i].d);
+        if (norm < 1e-10f) continue;
+
+        /* Unpack 4-bit nibbles → centroid floats */
+        float centroid_vals[QKTQ4_0] __attribute__((aligned(32)));
+        for (int j = 0; j < QKTQ4_0 / 2; j++) {
+            centroid_vals[j * 2]     = tq4_centroids[x[i].qs[j] & 0x0F];
+            centroid_vals[j * 2 + 1] = tq4_centroids[x[i].qs[j] >> 4];
+        }
+
+        /* AVX2: 4 × 8-wide FMA */
+        __m256 c0 = _mm256_load_ps(centroid_vals);
+        __m256 c1 = _mm256_load_ps(centroid_vals + 8);
+        __m256 c2 = _mm256_load_ps(centroid_vals + 16);
+        __m256 c3 = _mm256_load_ps(centroid_vals + 24);
+
+        __m256 yr0 = _mm256_loadu_ps(vy + i * QKTQ4_0);
+        __m256 yr1 = _mm256_loadu_ps(vy + i * QKTQ4_0 + 8);
+        __m256 yr2 = _mm256_loadu_ps(vy + i * QKTQ4_0 + 16);
+        __m256 yr3 = _mm256_loadu_ps(vy + i * QKTQ4_0 + 24);
+
+        __m256 prod = _mm256_mul_ps(c0, yr0);
+        prod = _mm256_fmadd_ps(c1, yr1, prod);
+        prod = _mm256_fmadd_ps(c2, yr2, prod);
+        prod = _mm256_fmadd_ps(c3, yr3, prod);
+
+        __m256 scale_vec = _mm256_set1_ps(norm * inv_scale);
+        acc = _mm256_fmadd_ps(scale_vec, prod, acc);
+    }
+
+    sumf = hsum_float_8(acc);
+#else
+    for (int i = 0; i < nb; ++i) {
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
+        if (norm < 1e-10f) continue;
+
+        float block_sum = 0.0f;
+        for (int j = 0; j < QKTQ4_0 / 2; j++) {
+            int idx_lo = x[i].qs[j] & 0x0F;
+            int idx_hi = x[i].qs[j] >> 4;
+            block_sum += tq4_centroids[idx_lo] * vy[i * QKTQ4_0 + (j * 2)];
+            block_sum += tq4_centroids[idx_hi] * vy[i * QKTQ4_0 + (j * 2 + 1)];
+        }
+        sumf += norm * inv_scale * block_sum;
+    }
+#endif
+
+    *s = sumf;
+}
+
+/*
+ * Pre-rotate query into the rotated domain for all blocks.
+ * Seeds are deterministic: seed_i = i * 2654435761u + 0xDEADBEEF
+ */
+void tq_prerotate_query_f32(float * GGML_RESTRICT y, int n) {
+    const int nb = n / QKTQ3_0;
+    assert(n % QKTQ3_0 == 0);
+
+    for (int i = 0; i < nb; i++) {
+        uint32_t seed = (uint32_t)(i * 2654435761u + 0xDEADBEEF);
+        tq_rotate_forward(y + i * QKTQ3_0, QKTQ3_0, seed);
+    }
+}

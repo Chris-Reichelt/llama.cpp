@@ -60,6 +60,13 @@ void ggml_vec_dot_tq4_0_f32  (int n, float * GGML_RESTRICT s, size_t bs, const v
 void ggml_vec_dot_tq3_0_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_tq4_0_f32_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
+/* Fused attention: pre-rotate query once, then dot with all keys without per-key rotation.
+ * tq_prerotate_query_f32: rotates Q in-place so each block is in the rotated domain.
+ * ggml_vec_dot_tq{3,4}_0_f32_prerotated: dot product assuming vy is already rotated. */
+void tq_prerotate_query_f32(float * GGML_RESTRICT y, int n);
+void ggml_vec_dot_tq3_0_f32_prerotated(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const float * GGML_RESTRICT vy, size_t by, int nrc);
+void ggml_vec_dot_tq4_0_f32_prerotated(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const float * GGML_RESTRICT vy, size_t by, int nrc);
+
 void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq2_xs_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq2_s_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);

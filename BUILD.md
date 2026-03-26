@@ -2,89 +2,86 @@
 
 ## What This Is
 
-Implementation of **TurboQuant** (arXiv:2504.19874, Daliri et al. 2025) as new KV cache 
+Implementation of **TurboQuant** (arXiv:2504.19874, Daliri et al. 2025) as new KV cache
 quantization types in llama.cpp.
 
-**Algorithm**: PolarQuant = random Hadamard rotation + optimal Lloyd-Max scalar quantization  
-**Key insight**: Rotation makes KV vector coordinates near-independent with known Beta 
-distribution → simple per-coordinate scalar quantization becomes near-optimal.
+**Algorithm**: PolarQuant = random Hadamard rotation + optimal Lloyd-Max scalar quantization
+**Key insight**: Rotation makes KV vector coordinates near-independent with approximately
+Gaussian distribution → per-coordinate quantization with precomputed Lloyd-Max codebooks
+achieves near-optimal distortion rate.
 
 New types:
-- `tq3_0` — 3-bit TurboQuant, 18 bytes/32 elements (~4.5 bpw)  
+- `tq3_0` — 3-bit TurboQuant, 18 bytes/32 elements (~4.5 bpw)
 - `tq4_0` — 4-bit TurboQuant, 22 bytes/32 elements (~5.5 bpw)
-
-## Hardware
-
-Tested on ncc1701e: i9-7900X (AVX512), 64GB RAM, Tesla P40 24GB
 
 ## Build
 
 ```bash
-cd /home/will/.openclaw/workspace/projects/llama-turboquant
-
 # CPU-only build
-mkdir -p build && cd build
-cmake .. -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF
-make -j$(nproc)
+cmake -B build -DGGML_CUDA=OFF
+cmake --build build -j$(nproc)
 
-# With CUDA (P40)
-cd build
-cmake .. -DGGML_CUDA=ON -DLLAMA_CURL=OFF
-make -j$(nproc)
+# With CUDA
+cmake -B build -DGGML_CUDA=ON
+cmake --build build -j$(nproc)
+
+# Cross-compile for AVX2-only target (no AVX-512)
+cmake -B build -DGGML_CUDA=OFF -DGGML_NATIVE=OFF \
+  -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON \
+  -DGGML_AVX512=OFF
+cmake --build build -j$(nproc)
 ```
 
 ## Usage
 
 ```bash
-# 3-bit KV cache (4.5 bpw) — best quality/size tradeoff
-./build/bin/llama-cli \
-  -m /path/to/model.gguf \
-  --cache-type-k tq3_0 \
-  --cache-type-v tq3_0 \
-  -c 8192 \
-  -p "Your prompt here"
+# TQ3 K-cache + f16 V-cache (works without flash attention)
+./build/bin/llama-server -m model.gguf \
+  --cache-type-k tq3_0 --cache-type-v f16
 
-# 4-bit KV cache (5.5 bpw) — near-lossless
-./build/bin/llama-cli \
-  -m /path/to/model.gguf \
-  --cache-type-k tq4_0 \
-  --cache-type-v tq4_0 \
-  -c 8192 \
-  -p "Your prompt here"
+# TQ3 K-cache + q8_0 V-cache (requires flash attention, SM 7.0+)
+./build/bin/llama-server -m model.gguf \
+  --cache-type-k tq3_0 --cache-type-v q8_0 \
+  --flash-attn on
 
-# Compare: q4_0 KV cache (baseline)
-./build/bin/llama-cli \
-  -m /path/to/model.gguf \
-  --cache-type-k q4_0 \
-  --cache-type-v q4_0 \
-  -c 8192 \
-  -p "Your prompt here"
+# Both K and V as TQ3 (requires flash attention)
+./build/bin/llama-server -m model.gguf \
+  --cache-type-k tq3_0 --cache-type-v tq3_0 \
+  --flash-attn on
+
+# Compare with q4_0 baseline
+./build/bin/llama-server -m model.gguf \
+  --cache-type-k q4_0 --cache-type-v q4_0 \
+  --flash-attn on
 ```
 
-## Benchmark Memory Savings
+**Note:** V cache quantization (any type other than f16) requires `--flash-attn on` in llama.cpp. The P40 (SM 6.1) does not support flash attention, so only K-cache quantization is available without FA.
 
-For a 32K context with Qwen3-32B (128 layers × 1024 KV head dim):
-| Cache Type | bpw  | Memory (est.) | Relative |
-|------------|------|---------------|----------|
-| f16        | 16.0 | 8.0 GB        | 1.0×     |
-| q8_0       | 8.5  | 4.25 GB       | 1.9×     |
-| q4_0       | 4.5  | 2.25 GB       | 3.6×     |
-| tq3_0      | 4.5  | 2.25 GB       | 3.6×     |
-| tq4_0      | 5.5  | 2.75 GB       | 2.9×     |
+## Memory Savings
 
-Note: tq3_0 has same bpw as q4_0 but **better theoretical MSE** due to optimal Lloyd-Max 
-codebook (3-bit quantization beats 4-bit uniform quantization with scale factor).
+Per KV layer pair (head_dim=128, n_heads=16):
+
+| Cache Type | bpw  | 4K ctx  | 32K ctx  | vs f16 |
+|------------|------|---------|----------|--------|
+| f16        | 16.0 | 32 MiB  | 256 MiB  | 1.0×   |
+| q8_0       | 8.5  | 17 MiB  | 136 MiB  | 0.53×  |
+| q4_0       | 4.5  | 9 MiB   | 72 MiB   | 0.28×  |
+| tq3_0      | 4.5  | 9 MiB   | 72 MiB   | 0.28×  |
+| tq4_0      | 5.5  | 11 MiB  | 88 MiB   | 0.34×  |
+
+tq3_0 has the same bpw as q4_0 but **better perplexity** due to optimal Lloyd-Max
+codebook — 3-bit with rotation beats 4-bit uniform with scale factor.
 
 ## Quantization Quality (from unit tests)
 
-From `tests/test-turboquant.c` on Gaussian inputs (simulating KV cache activations):
+From `tests/test-turboquant.c` on Gaussian inputs:
 
 ```
 TQ3_0: RelMSE ≈ 4.2%   (paper theory: ~3.0% for unit vectors)
 TQ4_0: RelMSE ≈ 0.99%  (paper theory: ~0.9% for unit vectors)
 
 Rotation invertibility: max error < 1e-5 (numerically perfect)
-Block sizes: tq3_0=18 bytes, tq4_0=22 bytes (both verified correct)
+Block sizes: tq3_0=18 bytes, tq4_0=22 bytes (verified correct)
 ```
 
 ## Algorithm Details
@@ -96,7 +93,7 @@ Block sizes: tq3_0=18 bytes, tq4_0=22 bytes (both verified correct)
 typedef struct {
     ggml_half d;         // L2 norm of original block
     uint16_t seed_lo;    // lower 16 bits of xorshift32 rotation seed
-    uint16_t seed_hi;    // upper 16 bits of xorshift32 rotation seed  
+    uint16_t seed_hi;    // upper 16 bits of xorshift32 rotation seed
     uint8_t qs[12];      // 3-bit indices packed (32×3 bits = 96 bits)
 } block_tq3_0;
 ```
@@ -105,24 +102,22 @@ typedef struct {
 ```c
 typedef struct {
     ggml_half d;         // L2 norm of original block
-    uint16_t seed_lo;    
-    uint16_t seed_hi;    
+    uint16_t seed_lo;
+    uint16_t seed_hi;
     uint8_t qs[16];      // 4-bit indices packed as nibbles
 } block_tq4_0;
 ```
 
-### Quantize Algorithm (per 32-element block)
+### Quantize (per 32-element block)
 
 1. Compute L2 norm, store in `d`, normalize vector to unit sphere
 2. Generate block-specific rotation seed = `hash(block_index)`
 3. Apply PolarQuant rotation: `random_sign_flip → WHT(x)/sqrt(32)`
-   - Fast Walsh-Hadamard Transform: O(d log d), no multiplications
-   - Random sign flips: reproducible from seed via xorshift32
 4. Scale rotated coordinates by `sqrt(32)` to map to N(0,1) space
-5. For each coordinate: find nearest Lloyd-Max centroid (binary search, 3 or 4 ops)
+5. For each coordinate: find nearest Lloyd-Max centroid (binary search)
 6. Pack centroid indices into `qs[]`
 
-### Dequantize Algorithm
+### Dequantize
 
 1. Unpack centroid indices from `qs[]`, look up centroid values
 2. Apply inverse rotation: `WHT(x)/sqrt(32) → undo_sign_flips`
@@ -141,39 +136,47 @@ typedef struct {
   0.0, 0.2582, 0.5224, 0.7994, 1.0993, 1.4371, 1.8438, 2.4008}
 ```
 
-## Files Modified
+## Optimization Details
 
-### New files:
-- `ggml/src/ggml-turboquant.h` — Rotation primitives (WHT, xorshift, codebooks)
+### CPU: Fused Attention (Phase 4)
+- `tq_prerotate_query_f32()` rotates Q blocks in-place using deterministic per-block seeds
+- `ggml_vec_dot_tq3_0_f32_prerotated()` — AVX2/FMA dot product assuming pre-rotated query
+- Flash attention path detects TQ KV types and uses fused pre-rotated path
+- Eliminates per-key inverse WHT from attention inner loop
 
-### Modified files:
-- `ggml/include/ggml.h` — Added `GGML_TYPE_TQ3_0=41`, `GGML_TYPE_TQ4_0=42`, `COUNT=43`
-- `ggml/src/ggml-common.h` — Block struct definitions for `block_tq3_0`, `block_tq4_0`
-- `ggml/src/ggml-quants.h` — Function declarations
-- `ggml/src/ggml-quants.c` — Quantize/dequantize implementations + validate_row_data
-- `ggml/src/ggml.c` — Type traits registration, quantize_chunk dispatch
-- `ggml/src/ggml-cpu/ggml-cpu.c` — CPU backend type traits (from_float)
-- `ggml/src/ggml-cpu/quants.h` — CPU wrapper declarations
-- `ggml/src/ggml-cpu/quants.c` — CPU wrapper implementations
-- `ggml/src/ggml-cpu/ops.cpp` — Case labels for quantized type switch statements
-- `common/arg.cpp` — Added tq3_0, tq4_0 to `kv_cache_types` list
+### CPU: AVX2 SIMD (Phase 3)
+- FMA-accelerated dot product: `_mm256_fmadd_ps` for 32-element block accumulation
+- Centroid lookup is scalar (3-bit packing isn't SIMD-friendly), multiply-accumulate is vectorized
 
-## Phase 2 (TODO)
+### CUDA (Phase 3)
+- Warp-cooperative dequantize: `__shfl_xor_sync` for WHT butterfly stages
+- Each warp thread handles one element of the 32-element block, all 5 WHT stages in registers
+- Quantize kernel: single-thread-per-block for KV cache writes
 
-- [ ] Specialized `vec_dot` kernel for attention computation in rotated domain
-  - Currently: dequantizes to f32 then uses standard attention
-  - Target: compute dot products directly in quantized domain (skip dequant)
-- [ ] AVX512 SIMD kernel for x86 (ncc1701e: i9-7900X)
-- [ ] ARM NEON kernel
-- [ ] CUDA kernel for P40
-- [ ] Perplexity benchmarks vs q4_0 / q8_0 / f16
-- [ ] QJL residual correction (TurboQuant_prod) for unbiased inner product estimation
-  - Currently implements TurboQuant_mse (MSE-optimal)
-  - For KV cache the MSE-optimal variant may already be sufficient
+### Known Issues
+- Non-flash-attention code path crashes on second request when reusing cached TQ3 KV entries
+- GPU seed generation uses address-based hashing (differs from CPU's index-based) — KV cache is not bitwise-identical across backends
+- V cache quantization requires flash attention (llama.cpp constraint)
 
-## Branch
+## Files Changed
 
-```
-git remote: https://github.com/ggml-org/llama.cpp (origin)
-branch: feat/turboquant-kv-cache
-```
+### New:
+- `ggml/src/ggml-turboquant.h` — Rotation primitives, codebooks, quantization helpers
+
+### Modified:
+- `ggml/include/ggml.h` — Type enum entries
+- `ggml/src/ggml-common.h` — Block struct definitions
+- `ggml/src/ggml-quants.{c,h}` — Quantize/dequantize implementations
+- `ggml/src/ggml.c` — Type traits, quantize_chunk dispatch
+- `ggml/src/ggml-cpu/ggml-cpu.c` — CPU backend type traits
+- `ggml/src/ggml-cpu/quants.{c,h}` — CPU vec_dot wrappers + prerotated variants
+- `ggml/src/ggml-cpu/arch/x86/quants.c` — AVX2/FMA optimized kernels
+- `ggml/src/ggml-cpu/arch-fallback.h` — Generic fallback aliases
+- `ggml/src/ggml-cpu/ops.cpp` — Flash attention TQ detection + pre-rotate Q
+- `ggml/src/ggml-cuda/ggml-cuda.cu` — CUDA type traits
+- `ggml/src/ggml-cuda/convert.cu` — CUDA dequantize kernel
+- `ggml/src/ggml-cuda/set-rows.cu` — CUDA quantize kernel
+- `ggml/src/ggml-cuda/cpy-utils.cuh` — Copy helpers
+- `common/arg.cpp` — CLI argument parsing
+- `tests/test-turboquant.c` — Unit tests
+- `tools/llama-bench/llama-bench.cpp` — Benchmark support

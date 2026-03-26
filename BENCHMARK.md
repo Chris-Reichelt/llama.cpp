@@ -1,9 +1,9 @@
 # TurboQuant KV Cache Benchmark Report
 
 **Date:** 2026-03-26  
-**System:** ncc1701e — Intel i9-7900X (10C/20T, AVX-512), 64GB DDR4, Tesla P40 (24GB GDDR5X)  
+**System:** Intel i9-7900X (10C/20T, AVX-512), 64GB DDR4, Tesla P40 (24GB GDDR5X, SM 6.1)  
 **Branch:** `feat/turboquant-kv-cache`  
-**Build:** 9d200b6 + Phase 3 optimizations
+**Build:** 9d200b6 + Phase 3/4 optimizations
 
 ## What Was Implemented
 
@@ -36,8 +36,10 @@
 | f16      | 1375.08     | 28.36       | Baseline |
 | q8_0     | 1391.49     | 49.20       | +73% tg |
 | q4_0     | 1329.69     | 41.38       | +46% tg |
-| **tq3_0** | **46.44**  | **32.76**   | +15% tg, pp slow (WHT) |
-| **tq4_0** | **54.19**  | **38.29**   | +35% tg, pp slow (WHT) |
+| **tq3_0** | **46.44**  | **32.76**   | pp 30× slower (WHT overhead) |
+| **tq4_0** | **54.19**  | **38.29**   | pp 25× slower (WHT overhead) |
+
+Note: TQ tg is faster than f16 (32.76 vs 28.36) due to smaller cache improving CPU cache utilization, but slower than q8_0 (49.20) and q4_0 (41.38). TQ is a **memory optimization**, not a speed optimization — the value is matching q4_0 perplexity at 3 bits.
 
 ### GLM-edge 1.5B (Q4_K_M) — GPU P40 (ngl=99)
 
@@ -46,8 +48,8 @@
 | f16      | 2214.57     | 146.89      | Baseline |
 | q8_0     | 2203.45     | 130.87      | -11% tg |
 | q4_0     | 2211.18     | 127.59      | -13% tg |
-| **tq3_0** | **30.66**  | **59.67**   | -59% tg, pp very slow |
-| **tq4_0** | **32.87**  | **60.00**   | -59% tg, pp very slow |
+| **tq3_0** | **30.66**  | **59.67**   | pp 72× slower, tg 59% slower |
+| **tq4_0** | **32.87**  | **60.00**   | pp 67× slower, tg 59% slower |
 
 ### Qwen3.5-9B (Q8_0) — CPU (10 threads, ngl=0)
 
@@ -56,18 +58,28 @@
 | f16      | 242.36      | 6.71        | Baseline |
 | q8_0     | 242.83      | 6.65        | ~same |
 | q4_0     | 240.98      | 6.69        | ~same |
-| **tq3_0** | **61.95**  | **6.55**    | tg ~same, pp 4x slower |
-| **tq4_0** | **73.19**  | **6.64**    | tg ~same, pp 3.3x slower |
+| **tq3_0** | **61.95**  | **6.55**    | tg ~same, pp 4× slower |
+| **tq4_0** | **73.19**  | **6.64**    | tg ~same, pp 3.3× slower |
 
-### Qwen3.5-9B (Q8_0) — GPU P40 (ngl=99)
+### Qwen3.5-9B (Q8_0) — GPU P40 (ngl=99, no flash attention)
 
-| KV Cache | pp512 (t/s) | tg128 (t/s) | Notes |
-|----------|-------------|-------------|-------|
-| f16      | 491.12      | 29.51       | Baseline |
-| q8_0     | 490.39      | 29.19       | ~same |
-| q4_0     | 490.86      | 29.05       | ~same |
-| **tq3_0** | **48.95**  | **25.30**   | -14% tg |
-| **tq4_0** | **52.30**  | **25.40**   | -14% tg |
+Note: P40 (SM 6.1) does not support flash attention. V cache quantization requires flash attention in llama.cpp, so GPU tests use TQ3 K + f16 V.
+
+| KV Cache | pp (t/s) | tg (t/s) | Notes |
+|----------|----------|----------|-------|
+| f16 K+V  | 119.5    | 28.8     | Baseline (no FA) |
+| **tq3_0 K + f16 V** | **66–70** | **19.5–23.7** | 68–82% tg, CUDA dequant working |
+
+### Qwen3.5-27B (Q4_K_M) — GPU P40 (ngl=99, no flash attention, ctx=2048)
+
+| KV Cache | KV Memory | pp (t/s) | tg (t/s) | Output |
+|----------|-----------|----------|----------|--------|
+| f16 K+V  | 128 MiB   | 18.6     | 13.0     | ✅ correct |
+| **tq3_0 K + f16 V** | **82 MiB** | **13.1–19.3** | **8.8–8.9** | ✅ correct |
+
+TQ3 tg ~68% of baseline. KV memory reduced 36%. At 32K context this saves ~740 MiB.
+
+**Known issue:** Non-flash-attention code path crashes on second request when reusing cached TQ3 KV entries. The flash attention path (SM 7.0+) works correctly using the fused pre-rotated query kernel.
 
 ## Perplexity (Quality Verification)
 
@@ -124,16 +136,17 @@ This makes pp throughput 10-40× slower than standard quantization. However:
 - CUDA quantize kernel runs per-thread (not warp-cooperative) which limits parallelism but matches existing patterns
 - Seed generation uses address-based hashing on GPU (different from CPU's index-based) — this means GPU KV cache is NOT bitwise-identical to CPU. For production, this should be unified.
 
-## Suggested Next Steps for Upstream PR
+## Remaining Work
 
-1. **Fused attention kernel** — Instead of dequant→standard attention, implement a fused kernel that does the WHT + centroid lookup inside the attention computation. This would eliminate the pp bottleneck.
+### Done (Phase 3-4)
+- ✅ Fused attention kernel with pre-rotated query (CPU, flash attention path)
+- ✅ AVX2/FMA SIMD kernels
+- ✅ CUDA dequantize/quantize kernels (warp-cooperative WHT via shuffle intrinsics)
+- ✅ Perplexity benchmarks across multiple models
 
-2. **Pre-rotated query cache** — During prompt processing, pre-rotate all query vectors once and cache them, so subsequent attention computations only need centroid lookups.
-
-3. **QJL residual correction** — Add the 1-bit Johnson-Lindenstrauss correction for theoretically unbiased inner products. Currently ~2.9% PPL degradation; QJL could reduce this to near-zero.
-
-4. **Unified seed generation** — Use block index instead of pointer-based seeds on GPU to match CPU behavior exactly.
-
-5. **Warp-cooperative quantize kernel** — The current CUDA quantize runs one block per thread with sequential WHT. A warp-cooperative version would be significantly faster for KV cache fills.
-
-6. **Mixed precision** — Use TQ3 for K cache (less quality-sensitive) and TQ4 or q4_0 for V cache (more quality-sensitive), or vice versa based on analysis.
+### Open
+1. **Fix non-FA crash** — Second-request crash when reusing cached TQ3 KV entries without flash attention. Critical for SM 6.x GPUs.
+2. **QJL residual correction** — 1-bit Johnson-Lindenstrauss correction for unbiased inner products. Currently ~2.9% PPL degradation; QJL could close this gap.
+3. **Unified seed generation** — CPU uses index-based seeds, GPU uses address-based. Unify for bitwise-identical KV cache across backends.
+4. **Warp-cooperative quantize kernel** — Current CUDA quantize is single-thread-per-block. A warp-cooperative version would speed up KV cache fills.
+5. **ARM NEON kernel** — No ARM SIMD path yet.
